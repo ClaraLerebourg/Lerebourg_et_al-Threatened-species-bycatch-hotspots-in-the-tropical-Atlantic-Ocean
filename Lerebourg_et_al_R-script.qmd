@@ -1,0 +1,1987 @@
+---
+title: "Threatened-species-bycatch-hotspots-in-the-tropical-Atlantic-Ocean"
+author: "Clara Lerebourg"
+format: html
+editor: visual
+---
+
+```{r setup, message=FALSE, warning=FALSE, include=FALSE}
+#| label: setup
+#| include: false
+
+# Load the necessary libraries
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(vegan)
+library(RPostgres)
+library(knitrdata)
+library(sf, quietly=TRUE)
+library(units)
+library(patchwork)
+library(igraph)
+
+# parameters
+start_date = '2013-01-01'
+end_date = '2022-12-31'
+world_boundaries <- rnaturalearth::ne_countries(returnclass = "sf",
+                                                scale       = "medium")
+ocean_xlim <- c(-40, 15)
+ocean_ylim <- c(-25, 25)
+ocean_xlim_short <- c(-13, 15)
+ocean_ylim_short <- c(-20, 8)
+ocean_xintercept <- c(-30, -20, -10, 0, 10)
+ocean_yintercept <- c(-20, -10, 0, 10, 20)
+```
+
+# *All the functions*
+
+## cwp_type_to_scales
+
+```{r}
+cwp_type_to_scales <- function(type) {
+  type <- as.character(type)
+
+  ll <- data.frame(
+    "5" = c(1, 1), "11" = c(1, 1),
+    "6" = c(5, 5), "55" = c(5, 5),
+    "1" = c(10, 5), "105" = c(10, 5),
+    "7" = c(10, 10), "1010" = c(10, 10),
+    "2" = c(20, 10), "2010" = c(20, 10),
+    "8" = c(20, 20), "2020" = c(20, 20),
+    "9" = c(30, 30), "3030" = c(30, 30),
+    check.names = FALSE
+  )
+  ll <- as.data.frame(t(ll))
+  names(ll) <- c("lonscale", "latscale")
+
+  I <- type %in% row.names(ll)
+  if (!all(I)) {
+    stop("Unknown CWP type: ", type[!I][1])
+  }
+
+  return(ll[type, , drop = FALSE])
+}
+```
+
+## cwp_code_to_geom
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+cwp_code_to_geom <- function(cwp,
+                             type = NULL,
+                             centroid = TRUE) {
+  cwp <- as.character(cwp)
+  if (is.null(type)) {
+    if (!all(nchar(cwp) == 7)) {
+      stop("Poorly formed cwp or type. Possibly cwp missing type.")
+    }
+    type <- as.numeric(substr(cwp, 1, 1))
+    cwp <- substr(cwp, 2, 1000)
+  } else {
+    if (!all(nchar(cwp) == 6)) {
+      stop("Poorly formed cwp or type. Possibly cwp including type.")
+    }
+  }
+  scales <- cwp_type_to_scales(type)
+  quad <- as.integer(substr(cwp, 1, 1))
+  signs <- rbind(c(1, 1), c(1, -1), c(-1, -1), c(-1, 1))
+  signs <- signs[quad, , drop = FALSE]
+  lat0 <- as.integer(substr(cwp, 2, 3))
+  lon0 <- as.integer(substr(cwp, 4, 6))
+  lon <- signs[, 1] * lon0
+  lat <- signs[, 2] * lat0
+  if (centroid) {
+    ln <- signs[, 1] * (lon0 + 0.5 * scales[, 1])
+    lt <- signs[, 2] * (lat0 + 0.5 * scales[, 2])
+    # This seems like a hard way to make points
+    pt <- sapply(
+      seq_along(ln),
+      function(i) {
+        sf::st_point(c(ln[i], lt[i]))
+      }, simplify = FALSE
+    )
+    pt <- sf::st_sfc(pt, crs = 4326)
+  } else {
+    ln <- signs[, 1] * (lon0 + scales[, 1])
+    lt <- signs[, 2] * (lat0 + scales[, 2])
+
+    # This seems like a hard way to make polygons
+    pt <- sapply(
+      seq_along(ln),
+      function(i) {
+        x <- cbind(
+          c(lon[i], ln[i], ln[i], lon[i], lon[i]),
+          c(lat[i], lat[i], lt[i], lt[i], lat[i])
+        )
+        sf::st_polygon(list(x))
+      }, simplify = FALSE
+    )
+    pt <- sf::st_sfc(pt, crs = 4326)
+  }
+  return(pt)
+}
+```
+
+## pie_chart_species_composition
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+pie_chart_species_composition <- function(dataframe,
+                                          threshold = 9) {
+  # Filtering data for the hotspot
+  # Selection of species columns
+  species_counts <- dataframe[, 3:12] %>%
+    dplyr::summarise(dplyr::across(tidyr::everything(),
+                                   sum))
+  
+  # Conversion to long format
+  species_df <- data.frame(species = names(species_counts),
+                           count = as.numeric(species_counts)) %>%
+    dplyr::mutate(percentage = (count / sum(count)) * 100) %>%
+    dplyr::mutate(species = ifelse(percentage < threshold, 
+                                   "Other",
+                                   as.character(species))) %>%
+    dplyr::group_by(species) %>%
+    dplyr::summarise(count = sum(count),
+                     .groups = "drop") %>%
+    dplyr::mutate(percentage = (count / sum(count)) * 100) %>%
+    dplyr:: mutate(species = factor(species,
+                                    levels = c(setdiff(species[species != "Other"], 
+                                                       "Other"), "Other"))) %>%
+    dplyr::arrange(percentage)
+  
+  # Graphic design
+  pie_chart_plot <- ggplot2::ggplot(species_df, ggplot2::aes(x = "",
+                                                             y = percentage,
+                                                             fill = species)) +
+    ggplot2::geom_bar(stat = "identity",
+                      width = 1) +
+    ggplot2::coord_polar(theta = "y") +
+    ggplot2::scale_fill_manual(values = c("Billfishes" = "#F07167",
+                                          "Devil_ray" = "darkorchid",
+                                          "Blue_shark" = "darkturquoise",
+                                          "Silky_shark" = "#00AFB9",
+                                          "Shortfin_Mako" = "blue4",
+                                          "Olive_ridley_turtle" = "#ffac81",
+                                          "Loggerhead_turtle" = "#FED9B7",
+                                          "Scalloped_hammerhead" = "#0081A7",
+                                          "Smooth_hammerhead" = "cadetblue2",
+                                          "Other" = "grey")) +
+    ggplot2::labs(title = "", 
+                  fill = "species") +
+    ggplot2::theme_void()
+  return(pie_chart_plot)
+}
+```
+
+## summarize_data
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+summarize_data <- function(dataframe,
+                           size_juv) {
+  # Calculation of proportions by category
+  nb_male_juvenile <- round(sum(dataframe$sex == "Male" &
+                                  dataframe$length <= size_juv,
+                                na.rm = TRUE))
+  nb_female_juvenile <- round(sum(dataframe$sex == "Female"
+                                  & dataframe$length <= size_juv,
+                                  na.rm = TRUE))
+  nb_male_adult <- round(sum(dataframe$sex == "Male"
+                             & dataframe$length > size_juv,
+                             na.rm = TRUE))
+  nb_female_adult <- round(sum(dataframe$sex == "Female"
+                               & dataframe$length > size_juv,
+                               na.rm = TRUE))
+  return(data.frame(nb_male_juvenile,
+                    nb_female_juvenile,
+                    nb_male_adult,
+                    nb_female_adult))
+}
+```
+
+## summarize_percentage
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+summarize_percentage <- function(data,
+                                 size_juv) {
+  data_filtered <- data %>% dplyr::filter(sex %in% c("Male",
+                                                     "Female"))
+  total_ind <- sum(data_filtered$count, 
+                   na.rm = TRUE)
+  # Calculation of percentage by category
+  perc_male_juvenile <- round(sum(data$sex == "Male" & 
+                                    data$length <= size_juv, 
+                                  na.rm = TRUE) / total_ind * 100)
+  perc_female_juvenile <- round(sum(data$sex == "Female" & 
+                                      data$length <= size_juv, 
+                                    na.rm = TRUE) / total_ind * 100)
+  perc_male_adult <- round(sum(data$sex == "Male" & 
+                                 data$length > size_juv, 
+                               na.rm = TRUE) / total_ind * 100)
+  perc_female_adult <- round(sum(data$sex == "Female" & 
+                                   data$length > size_juv, 
+                                 na.rm = TRUE) / total_ind * 100)
+  return(data.frame(perc_male_juvenile,
+                    perc_female_juvenile,
+                    perc_male_adult,
+                    perc_female_adult,
+                    total_ind))
+}
+```
+
+## pie_chart_percentage_bio
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+pie_chart_percentage_bio <- function(dataframe,
+                                     title,
+                                     legend = FALSE) {
+  if ("total_ind" %in% names(dataframe)) {
+    dataframe <- dataframe %>% dplyr::select(-total_ind)
+    }
+  data_long <- dataframe %>%
+    tidyr::pivot_longer(cols = tidyr::everything(),
+                        names_to = "category",
+                        values_to = "percentage")
+  if (legend == TRUE) {
+    ggplot2::ggplot(data_long %>%
+
+                      ggplot2::aes(x = "",
+                                   y = percentage,
+                                   fill = category)) +
+      ggplot2::geom_bar(stat = "identity", width = 1) +
+      ggplot2::coord_polar("y", start = 0) +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(axis.text.x = ggplot2::element_blank(),
+                     axis.ticks = ggplot2::element_blank(),
+                     panel.grid = ggplot2::element_blank()) +
+      ggplot2::labs(title = title, y = NULL, x = NULL) +
+      ggplot2::scale_fill_manual(values = c(perc_male_adult = "#005f73",
+                                            perc_male_juvenile = "#0a9396",
+                                            perc_female_adult = "#B56B3C",
+                                            perc_female_juvenile = "#e9d8a6"))
+  } else {
+    ggplot2::ggplot(data_long,
+                    ggplot2::aes(x = "",
+                                 y = percentage,
+                                 fill = category)) +
+      ggplot2::geom_bar(stat = "identity", width = 1) +
+      ggplot2::coord_polar("y", start = 0) +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(axis.text.x = ggplot2::element_blank(),
+                     axis.ticks = ggplot2::element_blank(),
+                     panel.grid = ggplot2::element_blank(),
+                     legend.position = "none") +
+      ggplot2::labs(title = title, y = NULL, x = NULL) +
+      ggplot2::scale_fill_manual(values = c(perc_male_adult = "#005f73",
+                                            perc_male_juvenile = "#0a9396",
+                                            perc_female_adult = "#B56B3C",
+                                            perc_female_juvenile = "#e9d8a6"))
+  }
+}
+```
+
+## generate_fishing_maps_and_charts
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+generate_fishing_maps_and_charts <- function(dataframe,
+                                             world_boundaries,
+                                             hotspot,
+                                             species) {
+  # Select column by species
+  species_col <- paste0("num_", species)
+  # A - Preparing the data for the map
+  bs <- dataframe %>%
+    dplyr::select(the_geom,
+                  annee_de_peche,
+                  mois_de_peche,
+                  tidyr::all_of(species_col)) %>%
+    dplyr::filter(.data[[species_col]] >= 1) %>%
+    dplyr::mutate(longitude = sf::st_coordinates(the_geom)[, 1],
+                  latitude = sf::st_coordinates(the_geom)[, 2]) %>%
+    sf::st_drop_geometry()
+  
+  bs$annee_de_peche <- factor(bs$annee_de_peche,
+                              levels = 2013:2022,
+                              ordered = TRUE)
+  bs$mois_de_peche <- factor(lubridate::month(bs$mois_de_peche),
+                             levels = 1:12,
+                             ordered = TRUE)
+  # Definition of geographical limits
+  hotspot_limits <- list(mauritania = list(xlim = c(-25, -10),
+                                           ylim = c(10, 22)),
+                         gabon = list(xlim = c(0, 15),
+                                      ylim = c(5, -8)),
+                         angola = list(xlim = c(20, 5),
+                                       ylim = c(-5, -17)))[[hotspot]]
+  
+  ocean_xintercept <- c(-30, -20, -10, 0, 10)
+  ocean_yintercept <- c(-20, -10, 0, 10, 20)
+  
+  # B - Preparation of data for the total number of sets
+  bs_total_sets <- dataframe %>%
+    dplyr::select(the_geom,
+                  obs_set_id,
+                  annee_de_peche,
+                  mois_de_peche,
+                  nombre_de_calees_pos) %>%
+    dplyr::mutate(longitude = sf::st_coordinates(the_geom)[, 1],
+                  latitude = sf::st_coordinates(the_geom)[, 2]) %>%
+    sf::st_drop_geometry()
+  # Addition of the nombre_de_calees column (number of sets)
+  data_set_group <- bs_total_sets %>%
+    dplyr::group_by(obs_set_id,
+                    annee_de_peche,
+                    mois_de_peche) %>%
+    dplyr::summarize(nombre_de_calees = sum(nombre_de_calees_pos,
+                                            na.rm = TRUE),
+                     longitude = dplyr::first(longitude),
+                     latitude = dplyr::first(latitude))
+  # Factorisation
+  data_set_group$annee_de_peche <- factor(data_set_group$annee_de_peche,
+                                          levels = 2013:2022,
+                                          ordered = TRUE)
+  data_set_group$mois_de_peche <- lubridate::month(data_set_group$mois_de_peche)
+  data_set_group$mois_de_peche <- factor(data_set_group$mois_de_peche,
+                                         levels = 1:12,
+                                         ordered = TRUE)
+  
+  # Preparation of data for the number of sets with the species
+  bs_species <- bs %>%
+    dplyr::filter(dplyr::case_when(hotspot == "mauritania" ~ latitude >= 16 & latitude <= 21 & 
+                                     longitude >= -21 & longitude <= -16,
+                                   hotspot == "gabon" ~ latitude <= 0 & latitude >= -4 & 
+                                     longitude >= 7 & longitude <= 10,
+                                   hotspot == "angola" ~ latitude <= -7 & latitude >= -13 & 
+                                     longitude >= 10 & longitude <= 14,
+                                   TRUE ~ FALSE))
+  
+  data_set_group <- data_set_group %>%
+    dplyr::filter(dplyr::case_when(hotspot == "mauritania" ~ latitude >= 16 & latitude <= 21 & 
+                                     longitude >= -21 & longitude <= -16,
+                                   hotspot == "gabon" ~ latitude <= 0 & latitude >= -4 & 
+                                     longitude >= 7 & longitude <= 10,
+                                   hotspot == "angola" ~ latitude <= -7 & latitude >= -13 & 
+                                     longitude >= 10 & longitude <= 14,
+                                   TRUE ~ FALSE))
+  
+  # Count of sets with the selected species and total
+  # Calculation of the number of sets with species per year
+  species_counts_year <- bs_species %>%
+    dplyr::group_by(annee_de_peche) %>%
+    dplyr::summarize(count_species = dplyr::n())
+  
+  species_counts_month <- bs_species %>%
+    dplyr::group_by(mois_de_peche) %>%
+    dplyr::summarize(count_species = dplyr::n())
+  
+  # Calculation of the total number of sets per year
+  set_counts_year <- data_set_group %>%
+    dplyr::group_by(annee_de_peche) %>%
+    dplyr::summarize(count_total_sets = dplyr::n())
+  
+  set_counts_month <- data_set_group %>%
+    dplyr::group_by(mois_de_peche) %>%
+    dplyr::summarize(count_total_sets = dplyr::n())
+  
+  # YEAR - Combination of the two data sets
+  combined_counts_year <- dplyr::full_join(species_counts_year,
+                                           set_counts_year,
+                                           by = "annee_de_peche")
+  combined_counts_year_long <- combined_counts_year %>%
+    tidyr::gather(key = "Type",
+                  value = "Count",
+                  count_species,
+                  count_total_sets)
+  
+  # MONTH - Combination of the two data sets
+  combined_counts_month <- dplyr::full_join(species_counts_month,
+                                            set_counts_month,
+                                            by = "mois_de_peche")
+  combined_counts_month_long <- combined_counts_month %>%
+    tidyr::gather(key = "Type",
+                  value = "Count",
+                  count_species,
+                  count_total_sets)
+  
+  # Graphic design 
+  # Map of sets with the selected species
+  bs <- bs %>%
+    dplyr::arrange(.data[[species_col]])
+  point_witout_species <- dataframe %>%
+    dplyr::select(the_geom,
+                  tidyr::all_of(species_col)) %>%
+    dplyr::filter(.data[[species_col]] == 0) %>%
+    dplyr::mutate(longitude = sf::st_coordinates(the_geom)[, 1],
+                  latitude = sf::st_coordinates(the_geom)[, 2]) %>%
+    sf::st_drop_geometry()
+  (map <- ggplot2::ggplot() +
+      ggplot2::theme(legend.text = ggplot2::element_text(size = 10),
+                     panel.background = ggplot2::element_rect(fill = "white"),
+                     panel.border = ggplot2::element_rect(color = "black", 
+                                                          fill = NA,
+                                                          size = 0.3),
+                     axis.title = ggplot2::element_text(size = 12),
+                     axis.text = ggplot2::element_text(size = 10),
+                     legend.position = c(0.15, 0.13),
+                     legend.box = "horizontal") +  # Légendes côte à côte
+      ggplot2::geom_sf(data = world_boundaries) +
+      ggspatial::coord_sf(xlim = hotspot_limits$xlim,
+                          ylim = hotspot_limits$ylim) +
+      ggplot2::geom_point(data = point_witout_species,
+                          mapping = ggplot2::aes(x = longitude, 
+                                                 y = latitude),
+                          color = "grey",
+                          size = 1,
+                          show.legend = FALSE) +
+      ggplot2::geom_point(data = bs,
+                          ggplot2::aes(x = longitude,
+                                       y = latitude,
+                                       size = .data[[species_col]],
+                                       color = .data[[species_col]]),
+                          show.legend = c(color = TRUE, size = TRUE)) +
+      ggplot2::geom_hline(yintercept = ocean_yintercept,
+                          linetype = "dashed",
+                          color = "darkgrey",
+                          linewidth = 0.2) +
+      ggplot2::geom_vline(xintercept = ocean_xintercept,
+                          linetype = "dashed",
+                          color = "darkgrey",
+                          linewidth = 0.2) +
+      ggplot2::scale_x_continuous(breaks = seq(-40, 10, 
+                                               by = 10)) +
+      ggplot2::scale_y_continuous(breaks = seq(-20, 20, 
+                                               by = 10)) +
+      ggplot2::scale_color_viridis_c(option = "plasma") +
+      ggplot2::scale_size_continuous(breaks = c(40, 30, 20, 10),  
+                                     labels = c("40", "30", "20", "10"),
+                                     guide = ggplot2::guide_legend(title.position = "top")) +
+      ggplot2::guides(color = ggplot2::guide_colorbar(title.position = "top"),
+                      size = ggplot2::guide_legend(title.position = "top")) +
+      ggplot2::labs( caption = "",
+                     x = "",
+                     y = ""))
+  
+  # Set by year
+  ylim_p1 <- max(combined_counts_year_long$Count, na.rm = TRUE) + 10
+  (plot1 <- ggplot2::ggplot(combined_counts_year_long,
+                            ggplot2::aes(x = annee_de_peche,
+                                         y = Count,
+                                         fill = Type)) +
+      ggplot2::geom_bar(stat = "identity",
+                        position = "dodge") +
+      ggplot2::geom_text(ggplot2::aes(label = Count),
+                         position = ggplot2::position_dodge(width = 0.9),
+                         vjust = -0.5,
+                         size = 4) +  # Add values above the bars
+      ggplot2::labs(x = "Year",
+                    y = "Count",
+                    fill = "") +  
+      ggplot2::theme_bw() +
+      ggplot2::theme(legend.position = c(0.05, 0.95),  # Legend top left
+                     legend.justification = c("left", "top"),
+                     legend.text = ggplot2::element_text(size = 20)) +  # Increases the size of the caption title
+      ggplot2::scale_x_discrete(drop = FALSE) +
+      ggplot2::ylim(0, ylim_p1) +
+      ggplot2::scale_fill_manual(values = c("#9B59B6",
+                                            "#FFCC00"),  
+                                 labels = c("Count of sets with species",
+                                            "Count of sets total"),
+                                 name = "") +  
+      ggplot2::theme(legend.position = "none",
+        legend.text = ggplot2::element_text(size = 10),
+        axis.text.x = ggplot2::element_text(size = 10),  # Increases the text size of the x axis graduations
+        axis.text.y = ggplot2::element_text(size = 10), # Increases the text size of the y axis graduations
+        axis.title.x = ggplot2::element_text(size = 10), # Increases the size of the x-axis title
+        axis.title.y = ggplot2::element_text(size = 10))  # Increases the size of the y-axis title
+  )
+  
+  # Set by month
+  ylim_p2 <- max(combined_counts_month_long$Count, na.rm = TRUE) + 10
+  (plot2 <- ggplot2::ggplot(combined_counts_month_long,
+                            ggplot2::aes(x = mois_de_peche,
+                                         y = Count,
+                                         fill = Type)) +
+      ggplot2::geom_bar(stat = "identity",
+                        position = "dodge") +
+      ggplot2::geom_text(ggplot2::aes(label = Count),
+                         position = ggplot2::position_dodge(width = 0.9),
+                         vjust = -0.5,
+                         size = 4) +  
+      ggplot2::labs(x = "Month",
+                    y = "Count",
+                    fill = "") +  #
+      ggplot2::theme_bw() +
+      ggplot2::theme(legend.position = c(0.05, 0.95),  
+                     legend.justification = c("left", "top"),
+                     legend.text = ggplot2::element_text(size = 15)) +  
+      ggplot2:: scale_x_discrete(drop = FALSE) +
+      ggplot2::ylim(0, ylim_p2) +
+      ggplot2::scale_fill_manual(values = c("#9B59B6",
+                                            "#FFCC00"),  
+                                 labels = c("Count of sets with species",
+                                            "Count of sets total"),
+                                 name = "") +  
+      ggplot2::theme(#legend.position = "none",
+                     axis.text.x = ggplot2::element_text(size = 10),  
+                     axis.text.y = ggplot2::element_text(size = 10),  
+                     axis.title.x = ggplot2::element_text(size = 10), 
+                     axis.title.y = ggplot2::element_text(size = 10))
+  )
+  
+  # Adjusting the theme for a longer map
+  map <- map + ggplot2::theme(aspect.ratio = 0.75,
+                              legend.text = ggplot2::element_text(size = 12))
+  
+  # Combination of the two bar graphs (plot1 above plot2)
+  plots_right <- cowplot::plot_grid(plot1,
+                                    plot2,
+                                    ncol = 1,
+                                    align = "v",
+                                    rel_heights = c(1, 1))
+  
+  # Organisation finale avec la carte plus large à gauche
+  final_plot <- cowplot::plot_grid(map,
+                                   plots_right,
+                                   ncol = 2,
+                                   align = "h",
+                                   rel_widths = c(1.2, 1))
+  
+  # Print
+  return(final_plot)
+}
+
+```
+
+# *Clean the data*
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+#| label: load_data
+#| echo: true
+
+# ORIGINAL DATA ----
+data <- readRDS("E:/git/reduce/data/ecd_wide_obs_fr_catch_sets_data.RDS")
+# Addition of columns cwp11_geom and cwp55_geom
+data <- data %>%
+  dplyr::mutate("year" = lubridate::year(x = d_act),
+                "cwp11_geom" = cwp_code_to_geom(data$cwp11,
+                                                        type = 11,
+                                                        centroid = FALSE),
+                "cwp55_geom" = cwp_code_to_geom(data$cwp55,
+                                                        type = 55,
+                                                        centroid = FALSE))
+data <- as.data.frame(data)
+# Filter the data : Atlantic, sets with observer data, ..
+obs_clean <- data %>%
+  dplyr::filter(ocean == "Atlantic", 
+                !is.na(obs_set_id), # Only sets with observer data
+                nombre_de_calees_pos > 0, # Only non-null sets
+                obs_school_type_code == code_assoc_groupe) # Limit to sets for 
+# Filter the data : FOB data
+obs_fob <- obs_clean %>%
+  dplyr::filter(code_assoc_groupe == 1) 
+
+# BIOLOGY DATA ----
+samples_observe <- readr::read_csv("E:/git/reduce/data/samples_observe_FSCFOB.csv")
+# Removes the year 2023 from the dataset and focuses solely on FOB schooltypes
+samples_observe <- samples_observe %>%
+  dplyr::filter(year != 2023,
+                school_type == "FOB") %>%
+  dplyr::mutate(month = format(as.Date(observation_date, format = "%Y-%m-%d"),
+                               "%m"))
+samples_observe$month = as.integer(samples_observe$month)
+
+# Mauritania
+samples_mauritania <- subset(samples_observe,
+                             latitude >= 16 & latitude <= 21 & 
+                               longitude >= -21 & longitude <= -16)
+
+# Gabon
+samples_gabon <- subset(samples_observe,
+                        latitude <= 0 & latitude >= -4 & 
+                          longitude >= 7 & longitude <= 10)
+
+# Angola
+samples_angola <- samples_observe %>%
+  subset(latitude <= -7 & latitude >= -13 & 
+           longitude >= 10 & longitude <= 14)
+
+# Guinea
+samples_guinea <- samples_observe %>%
+  subset(latitude >= 0 & latitude <= 10 & 
+           longitude >= -21 & longitude <= -10)
+
+# Data clean from OBS FOB ----
+# Select the bycatch species
+data_clean_prep <- obs_fob %>%
+  dplyr::select(c(obs_set_id,
+           the_geom,
+           heures_peche_standard,
+           mois_de_debarquement,
+           mois_de_peche,
+           year,
+           cwp11_geom,
+           sunset,
+           sunrise,
+           obs_ts,
+           # Billfishes
+           num_BUM,
+           num_SAI,
+           # Other bony fishes
+           num_ALN,
+           num_ALM,
+           num_CNT,
+           num_CFW, 
+           num_DIY,
+           num_DOL,
+           num_EHN, 
+           num_GBA,
+           num_JKY, 
+           num_KYP,
+           num_KYS,
+           num_LOB,
+           num_MOX,
+           num_MRW, 
+           num_REO,
+           num_RRU,
+           num_RUB,
+           num_RZV,
+           num_TRG,
+           num_USE,
+           num_WAH,
+           num_YTL,
+           # Rays
+           num_PLS,
+           num_RMM,
+           num_RMT,
+           # Sharks
+           num_BSH,
+           num_FAL,
+           num_SPL,
+           num_SPZ,
+           num_SMA, 
+           # Turtles
+           num_LKV,
+           num_TTL,
+           # Tunas
+           capture_skj_corrigee,
+           capture_yft_corrigee,
+           capture_bet_corrigee  ))
+
+# Add longitude and latitude
+data_clean_prep <- data_clean_prep %>%
+  dplyr::mutate(longitude = sf::st_coordinates(the_geom)[,1],
+                latitude = sf::st_coordinates(the_geom)[,2]) %>%
+  sf::st_drop_geometry() # drop geometry only after extracting coordinates
+
+# Replace NA values with 0 in numeric columns only
+data_clean_prep <- data_clean_prep %>%
+  dplyr::mutate(across(where(is.numeric), 
+                       ~replace_na(., 0)))
+
+# DATA CLEAN WITH SPECIES NAMES ----
+data_clean <- data_clean_prep
+# Change fao codes to group names and group species together
+data_clean$Billfishes <- data_clean$num_BUM + data_clean$num_SAI
+data_clean$Leatherjacket_filefishes <- data_clean$num_ALM + data_clean$num_ALN
+data_clean$Whitespotted_filefishes <- data_clean$num_JKY
+data_clean$Cottonmouth_jack <- data_clean$num_USE
+data_clean$Rough_triggerfish <- data_clean$num_CNT
+data_clean$Dolphinfishes <- data_clean$num_DOL + data_clean$num_CFW
+data_clean$Great_barracuda <- data_clean$num_GBA
+data_clean$Sea_chubs <- data_clean$num_KYP + data_clean$num_KYS
+data_clean$Tripletail <- data_clean$num_LOB
+data_clean$Sunfishes <- data_clean$num_MOX + data_clean$num_MRW + data_clean$num_RZV
+data_clean$Sharksucker <-  data_clean$num_REO + data_clean$num_EHN
+data_clean$Rainbow_runner <- data_clean$num_RRU
+data_clean$Blue_runner <- data_clean$num_RUB
+data_clean$Grey_triggerfish <- data_clean$num_TRG
+data_clean$Wahoo <- data_clean$num_WAH
+data_clean$Longfin_yellowtail <- data_clean$num_YTL
+data_clean$Pelagic_stingray <- data_clean$num_PLS
+data_clean$Devil_ray <- data_clean$num_RMM + data_clean$num_RMT
+data_clean$Blue_shark <- data_clean$num_BSH
+data_clean$Silky_shark <- data_clean$num_FAL
+data_clean$Scalloped_hammerhead <-  data_clean$num_SPL
+data_clean$Smooth_hammerhead <- data_clean$num_SPZ
+data_clean$Shortfin_Mako <- data_clean$num_SMA
+data_clean$Olive_ridley_turtle <- data_clean$num_LKV
+data_clean$Loggerhead_turtle <- data_clean$num_TTL
+data_clean$Major_tunas <- data_clean$capture_skj_corrigee + data_clean$capture_yft_corrigee + data_clean$capture_bet_corrigee
+
+# Remove the num_ columns
+data_clean <- data_clean %>%
+  dplyr::select(-(tidyr::starts_with("num_")))
+
+# Species select total
+species_select_total <- data_clean_prep %>%
+  dplyr::mutate(num_total = rowSums(select(., 
+                                           tidyr::starts_with("num")))) 
+# Works with time data
+data_clean <- data_clean %>%
+  dplyr::mutate(hrs_since_sunrise = difftime(obs_ts,
+                                      sunrise, 
+                                      units = "hours"),
+         mins_since_sunrise = difftime(obs_ts,
+                                       sunrise, 
+                                       units = "mins"),
+         hrs_since_sunrise = round(as.numeric(hrs_since_sunrise),
+                                   digits = 0),
+         quarter_since_sunrise = floor(as.numeric(mins_since_sunrise / 15)),
+         obs_ts = as.POSIXct(obs_ts, 
+                             format = "%Y-%m-%d %H:%M:%S", 
+                             tz = "UTC"),
+         sunrise = as.POSIXct(sunrise, 
+                              format = "%Y-%m-%d %H:%M:%S", 
+                              tz = "UTC"),
+         sunset = as.POSIXct(sunset, 
+                             format = "%Y-%m-%d %H:%M:%S",
+                             tz = "UTC"),
+         obs_dn = ifelse(obs_ts >= sunrise &
+                           obs_ts <= sunset, 
+                         "jour",
+                         "nuit")) 
+```
+
+# *Dominant bycatch species and percentage caught on dFADs*
+
+## *Table 1 - Table of the total observed number of bycatch individuals caught between 2013 and 2022*
+
+```{r}
+# Number of dFAD sets
+n_dFAD_sets <- obs_clean %>%
+  dplyr::filter(code_assoc_groupe == 1) %>%
+  dplyr::distinct(obs_set_id) %>%
+  nrow()
+# Number of FSC sets
+n_FSC_sets <- obs_clean %>%
+  dplyr::filter(code_assoc_groupe == 2) %>%
+  dplyr::distinct(obs_set_id) %>%
+  nrow()
+# FAO species order
+fao_order <- c(# Billfishes
+  "BUM", "SAI",
+  # Other bony fishes
+  "ALN", "ALM", "CNT", "CFW", "DIY", "DOL", "EHN", "GBA", "JKY",
+  "KYP", "KYS", "LOB", "MOX", "MRW", "REO", "RRU", "RUB", "RZV",
+  "TRG", "USE", "WAH", "YTL",
+  # Rays
+  "PLS", "RMM", "RMT",
+  # Sharks
+  "BSH", "FAL", "SPL", "SPZ", "SMA",
+  # Turtles
+  "LKV", "TTL")
+
+obs_clean %>%
+  dplyr::select(code_assoc_groupe, 
+                tidyr::starts_with("num_")) %>%
+  tidyr::pivot_longer(cols = starts_with("num_"),
+                      names_to = "FAO",
+                      names_prefix = "num_",
+                      values_to = "count") %>%
+  # Select only the species in 'fao_order'
+  dplyr::mutate(FAO = factor(FAO, 
+                             levels = fao_order)) %>%  
+  dplyr::group_by(FAO) %>%
+  dplyr::summarise(ALL = sum(count, 
+                             na.rm = TRUE),
+                   dFAD = sum(count[code_assoc_groupe == 1], 
+                              na.rm = TRUE),
+                   FSC = sum(count[code_assoc_groupe == 2],
+                             na.rm = TRUE),
+                   `no./dFAD set` = dFAD / n_dFAD_sets,
+                   `no./FSC set` = FSC / n_FSC_sets,
+                   `% caught on dFAD` = dFAD / (dFAD + FSC) * 100) %>%
+  dplyr::arrange(FAO)  
+```
+
+### *Table S1 - Number of bycatch individuals per set, categorized by species group, between 2013 and 2022 on dFADs*
+
+```{r, message=FALSE, warning=FALSE}
+#| label: num-silky-per-year
+#| echo: false
+silky <- species_select_total %>%
+  dplyr::group_by(year) %>%
+  dplyr::summarize(n = sum(num_total, na.rm = TRUE),
+                   n_fishes = sum(c(num_ALN,
+                                    num_ALM,
+                                    num_CNT,
+                                    num_CFW, 
+                                    num_DOL,
+                                    num_EHN, 
+                                    num_GBA,
+                                    num_JKY, 
+                                    num_KYP,
+                                    num_KYS,
+                                    num_LOB,
+                                    num_MOX,
+                                    num_MRW, 
+                                    num_REO,
+                                    num_RRU,
+                                    num_RUB,
+                                    num_RZV,
+                                    num_TRG,
+                                    num_USE,
+                                    num_WAH,
+                                    num_YTL), 
+                                  na.rm = TRUE),
+                   n_billfishes = sum(c(num_BUM,
+                                        num_SAI),
+                                      na.rm = TRUE),
+                   n_rays = sum(c(num_PLS, 
+                                  num_RMM,
+                                  num_RMT),
+                                na.rm = TRUE),
+                   n_sharks = sum(c(num_BSH,
+                                    num_FAL,
+                                    num_SPL,
+                                    num_SPZ,
+                                    num_SMA), 
+                                  na.rm = TRUE),
+                   n_turtles = sum(c(num_LKV, 
+                                     num_TTL), 
+                                   na.rm = TRUE),
+                   nsets = sum(!is.na(num_total) & num_total > 0),
+                   nsets_tot = length(num_total) ) %>%
+  dplyr::summarize(Prevalence = nsets / nsets_tot,
+                   `Number per set` = n / nsets_tot,
+                   `Number other bony fishes per set` = n_fishes / nsets_tot,
+                   `Number billfishes per set` = n_billfishes / nsets_tot,
+                   `Number rays per set` = n_rays / nsets_tot,
+                   `Number sharks per set` = n_sharks / nsets_tot,
+                   `Number turtles per set` = n_turtles / nsets_tot)
+
+silky <- round(silky, 2)
+silky
+```
+
+### *Table S2 - Summary statistics of species-specific catch, including the FAO species code, minimum, maximum, mean, and median number of individuals per set, as well as the minimum and maximum annual mean number of individuals per set. The colours are those of the IUCN protection levels used in table 1.*
+
+```{r}
+# List of columns corresponding to species
+species_cols <- c("num_BUM", "num_SAI", "num_ALN", "num_ALM", "num_CNT", "num_CFW",
+                  "num_DIY", "num_DOL", "num_EHN", "num_GBA", "num_JKY", "num_KYP",
+                  "num_KYS", "num_LOB", "num_MOX", "num_MRW", "num_REO", "num_RRU",
+                  "num_RUB", "num_RZV", "num_TRG", "num_USE", "num_WAH", "num_YTL",
+                  "num_PLS", "num_RMM", "num_RMT", "num_BSH", "num_FAL", "num_SPL",
+                  "num_SPZ", "num_SMA", "num_LKV", "num_TTL")
+
+# Create a summary table for all species
+summary_table <- species_cols %>%
+  lapply(function(species) {
+    # Compute yearly summary statistics for the current species
+    silky_summary <- species_select_total %>%
+      dplyr::group_by(year) %>%
+      dplyr::summarize(n = sum(num_total, na.rm = TRUE),
+                       n_species = sum(.data[[species]], na.rm = TRUE),
+                       nsets = sum(!is.na(num_total) & num_total > 0),
+                       nsets_tot = length(num_total),
+                       .groups = "drop") %>%
+      dplyr::mutate(Prevalence = nsets / nsets_tot,
+                    `Number per set` = n / nsets_tot,
+                    `Number species per set` = n_species / nsets_tot)
+    # Return a tibble with overall summary statistics for the species
+    tibble::tibble(FAO_Code = species,
+                   min_ind_per_set = round(min(species_select_total[[species]],
+                                               na.rm = TRUE), 2),
+                   max_ind_per_set = round(max(species_select_total[[species]], 
+                                               na.rm = TRUE), 2),
+                   mean_ind_per_set = round(mean(species_select_total[[species]],
+                                                 na.rm = TRUE), 2),
+                   median_ind_per_set = round(median(species_select_total[[species]],
+                                                     na.rm = TRUE), 2),
+                   min_ind_per_year = round(min(silky_summary$`Number species per set`,
+                                                na.rm = TRUE), 2),
+                   max_ind_per_year = round(max(silky_summary$`Number species per set`,
+                                                na.rm = TRUE), 2))}) %>%
+  bind_rows()  # Combine all species rows into one final summary table
+
+summary_table
+```
+
+### *Table S3 - Number of bycatch caught by species group between 2013 and 2022 on fishing aggregating devices*
+
+```{r, message=FALSE, warning=FALSE}
+#| echo: false
+silky <- species_select_total %>%
+  group_by(year) %>%
+  summarize(n = sum(num_total, na.rm = TRUE),
+            n_fishes = sum(c(num_ALN,
+                             num_ALM,
+                             num_CNT,
+                             num_CFW,
+                             num_DOL,
+                             num_EHN, 
+                             num_GBA,
+                             num_JKY, 
+                             num_KYP,
+                             num_KYS,
+                             num_LOB,
+                             num_MOX,
+                             num_MRW, 
+                             num_REO,
+                             num_RRU,
+                             num_RUB,
+                             num_RZV,
+                             num_TRG,
+                             num_USE,
+                             num_WAH,
+                             num_YTL), 
+                           na.rm = TRUE),
+            n_billfishes = sum(c(num_BUM,
+                                 num_SAI),
+                               na.rm = TRUE),
+            n_rays = sum(c(num_PLS, 
+                           num_RMM,
+                           num_RMT),
+                         na.rm = TRUE),
+            n_sharks = sum(c(num_BSH,
+                             num_FAL,
+                             num_SPL,
+                             num_SPZ,
+                             num_SMA), 
+                           na.rm = TRUE),
+            n_turtles = sum(c(num_LKV, 
+                              num_TTL), 
+                            na.rm = TRUE),
+            nsets = sum(!is.na(num_total) & num_total > 0),
+            nsets_tot = length(num_total) )
+
+silky <- round(silky, 2)
+silky
+```
+
+# *Community structure*
+
+## *Figure 1a - Dendrogram of bycatch species and IUCN conservation status based on NMDS and Jaccard dissimilarity (clusters were determined by a silhouette analysis)*
+
+```{r}
+# PRESENCE / ABSENCE DATA SETE ----
+data_dendro <- data_clean[16:40]
+data_dendro <- data_dendro[rowSums(data_dendro != 0) > 0, ]
+
+# Convert the data to presence absence after fitering
+presence_absence_matrix <- as.data.frame(lapply(data_dendro,
+                                                function(x) as.integer(x != 0)))
+species_occurrences <- colSums(presence_absence_matrix)
+
+species_occurrences
+
+# Outliers are removed from the dataset otherwise nmds and dissimilarity matrix will contains mistakes
+cols_to_keep <- species_occurrences %>%
+  names() %>%
+  .[species_occurrences >= 84] #1% of occurence 
+
+presence_absence_filtered <- presence_absence_matrix %>%
+  select(all_of(cols_to_keep))
+
+rows_to_keep <- rowSums(presence_absence_filtered != 0) > 0
+
+
+#Filter both data frames using the same logical index
+presence_absence_filtered <- presence_absence_filtered[rows_to_keep, ]
+
+# Percentage deleted
+total_occurrences <- sum(colSums(presence_absence_matrix))  # Total occurrences in the original data
+kept_occurrences <- sum(colSums(presence_absence_filtered))  # Occurrences kept after filtering
+percentage_deleted <- (total_occurrences - kept_occurrences) / total_occurrences * 100
+
+# Output the results
+cat("Total Occurrences:", 
+    total_occurrences, "\n")
+cat("Kept Occurrences:", 
+    kept_occurrences, "\n")
+cat("Percentage Deleted:",
+    percentage_deleted, "%\n")
+
+# Sites outliers
+single_species_sites <- rowSums(presence_absence_filtered == 1) == 1
+sites_with_one_species <- presence_absence_filtered[single_species_sites, ]
+
+# Counting the number of such sites
+num_sites_with_one_species <- nrow(sites_with_one_species)
+cat("Number of sites with only one species present:", 
+    num_sites_with_one_species, "\n")
+# Focus on the bycatch community so we don't want fishing sets with 1 species
+data_for_jaccard <- presence_absence_filtered[!single_species_sites, ]
+
+# JACCARD ----
+Jaccard_diss <- vegan::vegdist(data_for_jaccard,
+                               method = "jaccard")
+# NMDS ----
+# Define the number of cores to use
+num_cores <- min(parallel::detectCores() - 1, 4)  # Use up to 4 cores or one less than available
+clus <- parallel::makeCluster(num_cores)
+
+# Ensure that vegan functions are available on all cluster nodes
+parallel::clusterEvalQ(clus, library(vegan))
+
+# Run NMDS with parallel processing
+nmds_results <- vegan::metaMDS(Jaccard_diss,
+                                  distance = "jaccard",
+                                  autotransform = FALSE,
+                                  k = 3,
+                                  trymax = 20,
+                                  maxit = 999,
+                                  parallel = clus) 
+parallel::stopCluster(clus)
+
+# CLUSTERING ----
+# Hierarchical clustering on NMDS results
+str(nmds_results)
+stress_value <- nmds_results$stress
+nmds_results$species <- wascores(nmds_results$points,
+                                 data_for_jaccard,
+                                 expand = TRUE) # you can either assign the results by sites or species
+data <- nmds_results$species
+nmds_scores <- as.data.frame(scores(nmds_results,
+                                    display = "sites"))
+# assign clusters to nmds results
+diss <- dist(data)
+spclusters <- hclust(diss)
+clusters <- cutree(spclusters, k = 2)
+clust.dend <- as.dendrogram(spclusters)
+plot(spclusters)
+```
+
+## *Figure 1b - Co-occurrence Network to explore community structure and species associations.*
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+# Transpose the presence/absence table (species in columns and sites in rows)
+t_data_for_jaccard <- t(data_for_jaccard)
+
+# Compute the species co-occurrence matrix
+co_occurrence_matrix <- t_data_for_jaccard %*% t(t_data_for_jaccard)
+diag(co_occurrence_matrix) <- 0  # Set diagonals to zero to avoid self-links
+
+# Calculate the sum of occurrences per species
+species_sums <- rowSums(t_data_for_jaccard)
+
+# # Normalize the co-occurrence matrix
+# co_occurrence_normalized <- co_occurrence_matrix / outer(species_sums, 
+#                                                          species_sums, 
+#                                                          pmin)
+
+# Méthode de Jaccard normalisée (recommandée)
+union_matrix <- outer(species_sums, species_sums, "+") - co_occurrence_matrix
+co_occurrence_normalized <- co_occurrence_matrix / union_matrix
+diag(co_occurrence_normalized) <- 0
+
+# Create the normalized network
+species_network_normalized <- igraph::graph_from_adjacency_matrix(co_occurrence_normalized,
+                                                                  mode = "undirected",
+                                                                  weighted = TRUE, 
+                                                                  diag = FALSE)
+
+# Community detection on the normalized network
+communities_normalized <- igraph::cluster_louvain(species_network_normalized)
+
+# Louvain modularity
+igraph::modularity(communities_normalized)
+
+# Display the results
+plot(species_network_normalized, 
+     vertex.label = V(species_network_normalized)$name,
+     vertex.color = communities_normalized$membership, 
+     edge.width = E(species_network_normalized)$weight)
+
+```
+
+### *Figure S1 - Distribution maps of Group A (orange) and Group B (blue) species in the Atlantic, 2013-2022*
+
+```{r}
+# Now group by obs_set_id and retain longitude and latitude for each set
+data_set_group <- data_clean_prep %>%
+  dplyr::group_by(obs_set_id) %>%
+  dplyr::summarize(dplyr::across(dplyr::starts_with("num_"), 
+                          ~sum(.x, na.rm = TRUE)),
+            longitude = first(longitude),  # retain longitude
+            latitude = first(latitude)) %>%
+  dplyr::mutate(across(tidyr::starts_with("num_"), 
+                       ~ ifelse(.x > 1, 1, .x)))
+
+# Define the two groups of species
+group1_species <- c("num_DOL", "num_CFW",
+                    "num_ALM", "num_ALN",
+                    "num_TRG", 
+                    "num_YTL", 
+                    "num_RRU",
+                    "num_USE",
+                    "num_CNT", 
+                    "num_RUB", 
+                    "num_GBA", 
+                    "num_WAH", 
+                    "num_KYS", 
+                    "num_KYP",
+                    "num_LOB") 
+
+group2_species <- c("num_SPZ",
+                    "num_SMA",
+                    "num_SPL",
+                    "num_LKV", 
+                    "num_FAL", 
+                    "num_MOX", "num_MRW", "num_RZV",
+                    "num_REO", "num_EHN",
+                    "num_RMM", "num_RMT",
+                    "num_BSH", 
+                    "num_TTL",
+                    "num_SAI", 
+                    "num_BUM",
+                    "num_PLS") 
+
+# Add the percentages of species present in each group
+data_set_group <- data_set_group %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(total_group1 = sum(dplyr::c_across(tidyr::all_of(group1_species)),
+                                   na.rm = TRUE),
+                total_group2 = sum(dplyr::c_across(tidyr::all_of(group2_species)),
+                                   na.rm = TRUE),
+                total_species = total_group1 + total_group2,
+                perc_group1 = ifelse(total_species > 0, 
+                                            total_group1 / total_species * 100, 0),
+                perc_group2 = ifelse(total_species > 0,
+                                            total_group2 / total_species * 100, 0))
+
+data_set_group_filter <- data_set_group %>%
+  dplyr::filter(perc_group1 == 100,
+                total_group1 > 1)
+
+plot1 <- ggplot2::ggplot() +
+ggplot2::theme(legend.text = ggplot2::element_text(size = 10),
+               panel.background = ggplot2::element_rect(fill = "white"),
+               panel.border = ggplot2::element_rect(color = "black",
+                                                    fill = NA,
+                                                    size = 0.3))  +
+  ggplot2::geom_sf(data = world_boundaries) +
+  ggplot2::geom_point(data = data_set_group_filter, 
+                      aes(x = longitude, y = latitude), 
+                      color = "steelblue") +  
+  ggplot2::scale_fill_viridis_c() +
+  ggspatial::coord_sf(xlim = ocean_xlim,
+                      ylim = ocean_ylim) +
+  ggplot2::geom_hline(yintercept = ocean_yintercept,
+                      linetype = "dashed",
+                      color = "darkgrey",
+                      linewidth = 0.2) +
+  ggplot2::labs(fill = "Number ind.",
+                caption = "",
+                x = "",
+                y = "") +
+  ggplot2::geom_vline(xintercept = ocean_xintercept,
+                      linetype = "dashed",
+                      color = "darkgrey",
+                      linewidth = 0.2)
+
+data_set_group_filter <- data_set_group %>%
+  dplyr::filter(perc_group2 == 100,
+         total_group2 > 1)
+
+
+plot2 <- ggplot2::ggplot() +
+ggplot2::theme(legend.text = ggplot2::element_text(size = 10),
+               panel.background = ggplot2::element_rect(fill = "white"),
+               panel.border = ggplot2::element_rect(color = "black",
+                                                    fill = NA,
+                                                    size = 0.3))  +
+  ggplot2::geom_sf(data = world_boundaries) +
+  ggplot2::geom_point(data = data_set_group_filter, 
+                      aes(x = longitude, y = latitude), 
+                      color = "orange") +  
+  ggplot2::scale_fill_viridis_c() +
+  ggspatial::coord_sf(xlim = ocean_xlim,
+                      ylim = ocean_ylim) +
+  ggplot2::geom_hline(yintercept = ocean_yintercept,
+                      linetype = "dashed",
+                      color = "darkgrey",
+                      linewidth = 0.2) +
+  ggplot2::labs(fill = "Number ind.",
+                caption = "",
+                x = "",
+                y = "") +
+  ggplot2::geom_vline(xintercept = ocean_xintercept,
+                      linetype = "dashed",
+                      color = "darkgrey",
+                      linewidth = 0.2)
+
+plot1 + plot2
+
+
+```
+
+### *Figure S2 - Number of species caught per hour (in hours since sunrise) of vulnerable species group (orange) and silky billfishes group (blue) species in the Atlantic by sets and by tunas*
+
+```{r}
+# Data clean from OBS FOB ----
+# DATA CLEAN WITH SPECIES NAMES ----
+data_clean_dn <- data_clean %>%
+  # Creation of the three groups
+  dplyr::mutate("group_vulnerable_species" = Loggerhead_turtle + Sharksucker + Smooth_hammerhead + Pelagic_stingray +
+           Devil_ray + Scalloped_hammerhead + Blue_shark + Sunfishes + Olive_ridley_turtle,
+         "group_silky_billfishes" = Billfishes + Silky_shark) %>%
+  # Group by hours since sunrise
+  dplyr::group_by(hrs_since_sunrise) %>%
+  dplyr::summarise("group_vulnerable_species" = sum(group_vulnerable_species, 
+                                                    na.rm = TRUE),
+            "group_silky_billfishes" = sum(group_silky_billfishes, 
+                                           na.rm = TRUE),
+            "nb_sets" = dplyr::n(),
+            "nb_tons_tunas" = sum(Major_tunas, 
+                                  na.rm = TRUE),
+            "total" = group_vulnerable_species + group_silky_billfishes,
+            .groups = "drop") %>%
+  # Calculating the percentage
+  dplyr::mutate("VS_by_sets" = round((group_vulnerable_species / nb_sets), 2),
+         "VS_by_tunas" = round((group_vulnerable_species / nb_tons_tunas), 2),
+         "silky_by_sets" = round((group_silky_billfishes / nb_sets), 2),
+         "silky_by_tunas" = round((group_silky_billfishes / nb_tons_tunas), 2))
+
+# Data normality test - Shapiro (H0 = normal data)
+shapiro.test(data_clean_dn$VS_by_sets) # Normal data
+shapiro.test(data_clean_dn$VS_by_tunas) # Normal data
+shapiro.test(data_clean_dn$silky_by_sets)# Normal data
+shapiro.test(data_clean_dn$silky_by_tunas) # Normal data
+
+# Variance homogeneity (H0 = Variance not homogeneous)
+# car::leveneTest((Loggerhead_turtle + Sharksucker + Smooth_hammerhead + Pelagic_stingray +
+#                    Devil_ray + Scalloped_hammerhead + Blue_shark + Sunfishes + Olive_ridley_turtle) ~ as.factor(hrs_since_sunrise), data = data_clean) # homogeneous
+# car::leveneTest((Billfishes + Silky_shark) ~ as.factor(hrs_since_sunrise), data = data_clean) #homogeneous
+# 
+# car::leveneTest(((Loggerhead_turtle + Sharksucker + Smooth_hammerhead + Pelagic_stingray +
+#                    Devil_ray + Scalloped_hammerhead + Blue_shark + Sunfishes + Olive_ridley_turtle) / Major_tunas) ~ as.factor(hrs_since_sunrise ), data = data_clean) #not homogeneous
+# car::leveneTest((Billfishes + Silky_shark) / Major_tunas ~ as.factor(hrs_since_sunrise ), data = data_clean) #homogeneous
+
+# anova
+# anova_vs_sets <- aov((Loggerhead_turtle + Sharksucker + Smooth_hammerhead + Pelagic_stingray +
+#                          Devil_ray + Scalloped_hammerhead + Blue_shark + Sunfishes + Olive_ridley_turtle) ~ as.factor(hrs_since_sunrise), data = data_clean)
+# summary(anova_vs_tunas)
+# TukeyHSD(anova_vs_tunas)
+# Non-significant anova
+# 
+# anova_vs_tunas <- aov((Loggerhead_turtle + Sharksucker + Smooth_hammerhead + Pelagic_stingray +
+#                          Devil_ray + Scalloped_hammerhead + Blue_shark + Sunfishes + Olive_ridley_turtle / Major_tunas) ~ as.factor(hrs_since_sunrise), data = data_clean)
+# summary(anova_vs_tunas)
+# TukeyHSD(anova_vs_tunas)
+# # Non-significant anova
+# 
+# anova_silky_tunas <- aov((Billfishes + Silky_shark/ Major_tunas) ~ as.factor(hrs_since_sunrise), data = data_clean)
+# summary(anova_vs_tunas)
+# TukeyHSD(anova_vs_tunas)
+# # Non-significant anova
+# 
+# anova_silky_sets <- aov((Billfishes + Silky_shark) ~ as.factor(hrs_since_sunrise ), data = data_clean)
+# summary(anova_silky_tunas)
+# TukeyHSD(anova_silky_tunas)
+# # Non-significant anova
+
+# Filter to exclude time 12
+data_clean_dn <- data_clean_dn %>%
+  dplyr::filter(hrs_since_sunrise != 12)
+
+# Colour palette
+colors <- c("Vulnerable species group" = "orange", 
+            "Silky-billfishes group" = "steelblue")
+
+# VS_by_sets
+plot1 <- ggplot2::ggplot(data_clean_dn, aes(x = as.factor(hrs_since_sunrise),
+                                            y = VS_by_sets,
+                                            fill = "Vulnerable species group")) +
+  ggplot2::geom_col() +
+  ggplot2::geom_text(ggplot2::aes(label = nb_sets), 
+                     vjust = -0.5, 
+                     size = 3.5) +
+  ggplot2::scale_fill_manual(values = colors, name = "") +
+  ggplot2::labs(x = "", 
+                y = "Nb. of ind. caught by sets", 
+                title = "") +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(legend.position = "none") +
+  ggplot2::coord_cartesian(ylim = c(0, 2.7))
+
+# silky_by_sets
+plot2 <- ggplot2::ggplot(data_clean_dn, 
+                         ggplot2::aes(x = as.factor(hrs_since_sunrise), 
+                                      y = silky_by_sets, 
+                                      fill = "Silky-billfishes group")) +
+  ggplot2::geom_col() +
+  ggplot2::geom_text(aes(label = nb_sets), 
+                     vjust = -0.5, 
+                     size = 3.5) +
+  ggplot2::scale_fill_manual(values = colors, name = "") +
+  ggplot2::labs(x = "", 
+                y = "", 
+                title = "") +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(legend.position = "none")+
+  ggplot2::coord_cartesian(ylim = c(0, 2.7))
+
+# VS_by_tunas
+plot3 <- ggplot2::ggplot(data_clean_dn, 
+                         ggplot2::aes(x = as.factor(hrs_since_sunrise), 
+                                      y = VS_by_tunas, 
+                                      fill = "Vulnerable species group")) +
+  ggplot2::geom_col() +
+  ggplot2::geom_text(ggplot2::aes(label = nb_sets), 
+                     vjust = -0.5, 
+                     size = 3.5) +
+  ggplot2::scale_fill_manual(values = colors, 
+                             name = "") +
+  ggplot2::labs(x = "Hours since sunrise", 
+                y = "Nb. of ind. caught by tons of major tunas",
+                title = "") +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(legend.position = "none")+
+  ggplot2::coord_cartesian(ylim = c(0, 0.15))
+
+# silky_by_tunas
+plot4 <- ggplot2::ggplot(data_clean_dn, 
+                         ggplot2::aes(x = as.factor(hrs_since_sunrise),
+                                      y = silky_by_tunas, 
+                                      fill = "Silky-billfishes group")) +
+  ggplot2::geom_col() +
+  ggplot2::geom_text(ggplot2::aes(label = nb_sets),
+                     vjust = -0.5, 
+                     size = 3.5) +
+  ggplot2::scale_fill_manual(values = colors, 
+                             name = "") +
+  ggplot2::labs(x = "Hours since sunrise",
+                y = "", 
+                title = "") +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(legend.position = "none")+
+  ggplot2::coord_cartesian(ylim = c(0, 0.15))
+
+# Assembling graphs with a single common legend
+legend <- cowplot::get_legend(plot1 + 
+                                ggplot2::theme(legend.position = "bottom"))
+
+final_plot <- (plot1 | plot2) / (plot3 | plot4) + 
+  patchwork::plot_layout(guides = "collect") & 
+  ggplot2::theme(legend.position = "bottom")
+
+cowplot::plot_grid(final_plot, 
+                   legend, ncol = 1, 
+                   rel_heights = c(1, 0.1))
+```
+
+# *Hotspot and distribution of bycatch species*
+
+## *Figure 2a - Bycatch hotspots of vulnerable species in the Eastern Atlantic with top species per hotspot*
+
+### *Map*
+
+```{r}
+bs <- data_clean_prep %>%
+  dplyr::select(c(the_geom,
+           mois_de_debarquement,
+           num_BUM,
+           num_MOX,
+           num_RMM,
+           num_RMT,
+           num_BSH,
+           num_FAL,
+           num_SPL,
+           num_SPZ,
+           num_SMA,
+           num_LKV,
+           num_TTL)) %>%
+  dplyr::mutate(num_TOTAL = rowSums(dplyr::select(., 
+                                                  tidyr::starts_with("num_")), 
+                                    na.rm = TRUE)) %>%
+  dplyr::filter(num_TOTAL > 20, #Minimum 20 individuals per set
+         num_TOTAL != 190) %>% # Exclude the 190 ind. outlier for a better visibility
+  dplyr::arrange(num_TOTAL)
+
+bs = sf::st_as_sf(bs)
+
+bs <- bs %>%
+  dplyr::mutate(longitude = sf::st_coordinates(the_geom)[,1],
+         latitude = sf::st_coordinates(the_geom)[,2]) %>%
+  sf::st_drop_geometry()
+
+
+## Now plot the results
+(map_year <- ggplot2::ggplot() +
+    ggplot2::theme(legend.text = ggplot2::element_text(size = 10),
+                   panel.background = ggplot2::element_rect(fill = "white"),
+                   panel.border = ggplot2::element_rect(color = "black",
+                                                        fill = NA,
+                                                        size = 0.3),
+                   legend.position = c(0.13, 0.12)) +  # Moving the legend to the bottom left
+    ggplot2::geom_sf(data = world_boundaries) +
+    ggplot2::geom_point(data = bs, 
+                        aes(x = longitude, 
+                            y = latitude, 
+                            fill = num_TOTAL),
+                        size = 3, 
+                        shape = 21) +  
+    ggplot2::scale_fill_viridis_c() +
+    ggspatial::coord_sf(xlim = ocean_xlim,
+                        ylim = ocean_ylim) +
+    ggplot2::geom_hline(yintercept = ocean_yintercept,
+                        linetype = "dashed",
+                        color = "darkgrey",
+                        linewidth = 0.2) +
+    ggplot2::labs(fill = "Number ind.",
+                  caption = "",
+                  x = "",
+                  y = "") +
+    ggplot2::geom_vline(xintercept = ocean_xintercept,
+                        linetype = "dashed",
+                        color = "darkgrey",
+                        linewidth = 0.2))
+```
+
+### *Species composition*
+
+```{r}
+data_clean_pie <- data_clean %>%
+  dplyr::select(c(latitude,
+           longitude,
+           Billfishes,
+           Sunfishes,
+           Devil_ray,
+           Blue_shark,
+           Silky_shark,
+           Scalloped_hammerhead,
+           Smooth_hammerhead, 
+           Shortfin_Mako,
+           Olive_ridley_turtle,
+           Loggerhead_turtle))
+
+# Separation of data sets by hotspot
+
+# MAURITANIE ----
+hotspot_mauritania <- subset(data_clean_pie,
+                             latitude >= 16 & latitude <= 21 & 
+                               longitude >= -21 & longitude <= -16)
+pie_chart_species_composition(hotspot_mauritania)
+
+# GABON ----
+hotspot_gabon <- subset(data_clean_pie,
+                        latitude <= 0 & latitude >= -4 & 
+                          longitude >= 7 & longitude <= 10)
+
+pie_chart_species_composition(hotspot_gabon)
+
+# ANGOLA ----
+hotspot_angola <- subset(data_clean_pie,
+                         latitude <= -7 & latitude >= -13 & 
+                           longitude >= 10 & longitude <= 14)
+pie_chart_species_composition(hotspot_angola)
+
+
+
+# GUINEA ----
+hotspot_guinea <- subset(data_clean_pie,
+                         latitude >= 0 & latitude <= 10 & 
+                           longitude >= -21 & longitude <= -10)
+pie_chart_species_composition(hotspot_guinea)
+
+# Atlantique ----
+pie_chart_species_composition(data_clean_pie)
+```
+
+## *Figure 2b - Breakdown by sex and life-stage of the three top shark species caught in each hotspot and the Atlantic overall*
+
+```{r}
+# Size juvenile
+#size_juv <- 225 # Silky shark
+#size_juv <- 230 # Scalloped hammerhead
+#size_juv <- 265 # Smooth hammerhead
+size_juv <- 200 # Rays
+#size_juv <- 221 # Blue shark
+
+
+samples_observe_bio <- samples_observe[!(
+  # Exclude data from the first area (latitude between 16 and 21, longitude between -21 and -16)
+  (samples_observe$latitude >= 16 & samples_observe$latitude <= 21 & 
+     samples_observe$longitude >= -21 & samples_observe$longitude <= -16) |
+  
+  # Exclude data from the second area (latitude between 0 and -4, longitude between 7 and 10)
+  (samples_observe$latitude <= 0 & samples_observe$latitude >= -4 & 
+     samples_observe$longitude >= 7 & samples_observe$longitude <= 10) |
+  
+  # Exclude data from the third area (latitude between -7 and -13, longitude between 10 and 14)
+  (samples_observe$latitude <= -7 & samples_observe$latitude >= -13 & 
+     samples_observe$longitude >= 10 & samples_observe$longitude <= 14) |
+  
+  # Exclude data from the area between latitude 0-10 and longitude -21 to -10
+  (samples_observe$latitude >= 0 & samples_observe$latitude <= 10 & 
+     samples_observe$longitude >= -21 & samples_observe$longitude <= -10)
+), ]
+
+bio_observe <- samples_observe_bio %>%
+  dplyr::filter(fao_code %in% c("SPL")) %>%
+  dplyr::select(fao_code,
+         length, 
+         size_type, 
+         weight,
+         count,
+         sex, 
+         year, 
+         set_id)
+
+bio_mauritania <- samples_mauritania %>%
+  dplyr::filter(fao_code %in% c("SPL")) %>%
+  dplyr::select(fao_code, 
+         length, 
+         size_type,
+         weight,
+         count,
+         sex, 
+         year, 
+         set_id)
+
+bio_gabon <- samples_gabon %>%
+  dplyr::filter(fao_code %in% c("SPL")) %>%
+  dplyr::select(fao_code, 
+         length, 
+         size_type, 
+         weight, 
+         count, 
+         sex, 
+         year,
+         set_id)
+
+bio_angola <- samples_angola %>%
+  dplyr::filter(fao_code %in% c("SPL")) %>%
+  dplyr::select(fao_code, 
+         length, 
+         size_type, 
+         weight, 
+         count, 
+         sex, 
+         year, 
+         set_id)
+
+bio_guinea <- samples_guinea %>%
+  dplyr::filter(fao_code %in% c("SPL")) %>%
+  dplyr::select(fao_code,
+         length, 
+         size_type, 
+         weight, 
+         count, 
+         sex, 
+         year, 
+         set_id)
+
+# CHI2 ----
+# Apply the summarize_data function to each dataset
+result_observe <- summarize_data(bio_observe, 
+                                         size_juv)
+result_mauritania <- summarize_data(bio_mauritania,
+                                            size_juv)
+result_gabon <- summarize_data(bio_gabon,
+                                       size_juv)
+result_angola <- summarize_data(bio_angola,
+                                        size_juv)
+result_guinea <- summarize_data(bio_guinea,
+                                        size_juv)
+
+# Add hotspot names
+result_observe$Hotspot <- "Atlantic"
+result_mauritania$Hotspot <- "Mauritania"
+result_gabon$Hotspot <- "Gabon"
+result_angola$Hotspot <- "Angola"
+result_guinea$Hotspot <- "Guinea"
+
+# Combine the results
+final_result_SPL_FOB <- rbind(result_mauritania, 
+                              result_gabon, 
+                              result_angola,
+                              result_guinea,
+                              result_observe)
+final_result_SPL_FOB
+
+# Create the contingency table
+tableau_contingence <- final_result_SPL_FOB %>%
+  tidyr::pivot_longer(-Hotspot, 
+               names_to = "Category",
+               values_to = "Number") %>%
+  tidyr::pivot_wider(names_from = Hotspot, 
+              values_from = Number)
+
+# Convert to matrix for Chi-squared test
+matrice_contingence <- tableau_contingence %>%
+  tibble::column_to_rownames(var = "Category") %>% # Set first column as row names
+  as.matrix()
+
+# Compute expected values
+expected <- chisq.test(matrice_contingence)$expected
+expected # Should be greater than 5 in 80% of the cells, otherwise use Fisher’s test
+
+# Perform Chi-squared test
+test_chi2 <- chisq.test(matrice_contingence)
+test_chi2
+
+# Extract standardized residuals
+residus <- test_chi2$stdres
+df_residus <- as.data.frame(as.table(residus))
+
+# Heatmap of standardized residuals
+ggplot2::ggplot(df_residus, 
+       ggplot2::aes(Var2, 
+           Var1, 
+           fill = Freq)) +
+  ggplot2::geom_tile() +  # Heatmap
+  ggplot2::geom_text(aes(label = round(Freq, 2)), 
+                     color = "black") +  # Add rounded values
+  ggplot2::scale_fill_gradient2(low = "#023e8a", 
+                                mid = "white",
+                                high = "#d90429") +
+  ggplot2::labs(title = "Standardized residuals of Chi² test - SPL",
+       x = "Hotspot", y = "Category") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "none")  # Remove legend
+
+# CHART PIE ----
+
+# Apply the function to each dataset
+percentage_observe <- summarize_percentage(bio_observe,
+                                                   size_juv)
+percentage_mauritania <- summarize_percentage(bio_mauritania,
+                                                      size_juv)
+percentage_gabon <- summarize_percentage(bio_gabon, 
+                                                 size_juv)
+percentage_angola <- summarize_percentage(bio_angola, 
+                                                  size_juv)
+percentage_guinea <- summarize_percentage(bio_guinea, 
+                                                  size_juv)
+
+# Plot without legend
+plot_observe <- pie_chart_percentage_bio(percentage_observe,
+                                         "Atlantic", 
+                                         legend = FALSE)
+plot_mauritania <- pie_chart_percentage_bio(percentage_mauritania,
+                                            "Mauritania", 
+                                            legend = FALSE)
+plot_gabon <- pie_chart_percentage_bio(percentage_gabon, 
+                                       "Gabon", 
+                                       legend = FALSE)
+plot_angola <- pie_chart_percentage_bio(percentage_angola, 
+                                        "Angola", 
+                                        legend = FALSE)
+plot_guinea <- pie_chart_percentage_bio(percentage_guinea, 
+                                        "Guinea", 
+                                        legend = FALSE)
+
+# Create a plot to extract a single legend
+legend_plot <- ggplot2::ggplot(percentage_observe %>%
+                        dplyr::select(-total_ind) %>%
+                        tidyr::pivot_longer(cols = tidyr::everything(),
+                                     names_to = "Category", 
+                                     values_to = "Percentage"),
+                      ggplot2::aes(x = "", 
+                          y = Percentage,
+                          fill = Category)) +
+  ggplot2::geom_bar(stat = "identity", 
+           width = 1) +
+  ggplot2::scale_fill_manual(values = c(perc_male_adult = "#005f73",
+                               perc_male_juvenile = "#0a9396",
+                               perc_female_adult = "#B56B3C",
+                               perc_female_juvenile = "#e9d8a6")) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(legend.position = "right",
+        axis.text = ggplot2::element_blank(),
+        axis.ticks = ggplot2::element_blank(),
+        panel.grid = ggplot2::element_blank()) +
+  ggplot2::labs(fill = "Category")
+
+# Extract the single legend
+get_legend <- function(my_plot) {
+  tmp <- ggplot2::ggplot_gtable(ggplot2::ggplot_build(my_plot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+legend <- patchwork::wrap_elements(get_legend(legend_plot))
+
+# Arrange the plots in 2x2 (or more) layout with legend on the right
+layout <- (plot_observe + 
+             plot_mauritania + 
+             plot_gabon + 
+             plot_angola + 
+             plot_guinea) + 
+  patchwork::plot_layout(guides = "collect") & 
+  ggplot2::theme(legend.position = "right")
+
+# Display the final plot
+layout
+
+# Tracking table for % of juveniles, males, and females by species ----
+
+# Add hotspot names
+percentage_observe$Hotspot <- "Atlantic"
+percentage_mauritania$Hotspot <- "Mauritania"
+percentage_gabon$Hotspot <- "Gabon"
+percentage_angola$Hotspot <- "Angola"
+percentage_guinea$Hotspot <- "Guinea"
+
+# Combine the results
+final_result_SPL_FOB <- rbind(percentage_mauritania,
+                              percentage_gabon, 
+                              percentage_angola, 
+                              percentage_guinea,
+                              percentage_observe)
+
+# Display the final table
+final_result_SPL_FOB
+
+```
+
+### *Figure S3: Count of the number of sets per month and per hotspot region*
+
+```{r}
+bs <- obs_fob %>%
+  dplyr::select(c(the_geom,
+                  obs_set_id,
+                  mois_de_peche,
+                  nombre_de_calees_pos)) 
+
+bs <- bs %>%
+  dplyr::mutate(longitude = sf::st_coordinates(the_geom)[,1],
+         latitude = sf::st_coordinates(the_geom)[,2]) %>%
+  sf::st_drop_geometry()
+
+bs <- bs %>%
+  dplyr::filter(latitude >= 16 & latitude <= 21 & longitude >= -21 & longitude <= -16, # Mauritanie
+         #latitude <= 0 & latitude >= -4 & longitude >= 7 & longitude <= 10, #Gabon
+         #latitude <= -7 & latitude >= -13 & longitude >= 10 & longitude <= 14, # Angola
+         #latitude >= 0 & latitude <= 10 & longitude >= -21 & longitude <= -10 # Guinée
+         )
+
+data_set_group <- bs %>%
+  dplyr::group_by(obs_set_id, mois_de_peche) %>%
+  dplyr::summarize(nombre_de_calees = sum(nombre_de_calees_pos, 
+                                   na.rm = TRUE),  # sum of set by obs_set_id
+            longitude = first(longitude),  # keeps the first longitude value
+            latitude = first(latitude))
+
+data_set_group$mois_de_peche = factor(data_set_group$mois_de_peche,levels=1:12,ordered=TRUE)
+
+ggplot2::ggplot(data=data_set_group,
+                         ggplot2::aes(x = mois_de_peche)) +
+  ggplot2::stat_count() +
+  ggplot2::scale_x_discrete(drop=FALSE) +
+  ggplot2::labs(x = "Month", y = "count of total set") +
+  ggplot2::theme_bw() +
+  ggplot2::ylim(0, 700) +
+  ggplot2::geom_text(stat = 'count', 
+                     ggplot2::aes(label = ..count..), 
+                     vjust = -0.5)
+
+```
+
+### *Table S6 - Number of species per sets observed in the biodiversity hotspot of Mauritania.*
+
+```{r}
+resultat <- data_clean_prep %>%
+  dplyr::filter(latitude >= 16 & latitude <= 21 & longitude >= -21 & longitude <= -16) %>%
+  dplyr::mutate(num_RM = num_RMM + num_RMT) %>%  # Replaces num_RMM and num_RMT with num_RM
+  dplyr::select(num_BUM,
+                num_MOX,
+                num_TRG,
+                num_RM, 
+                num_BSH,
+                num_FAL,
+                num_SPL,
+                num_SPZ,
+                num_SMA, 
+                num_LKV,
+                num_TTL,
+                mois_de_peche) %>%
+  dplyr::group_by(mois_de_peche) %>%
+  dplyr::summarise(dplyr::across(tidyr::starts_with("num_"),
+                                 sum,
+                                 na.rm = TRUE)) 
+
+nb_lignes_par_mois <- data_clean_prep %>%
+  dplyr::filter(latitude >= 16 & latitude <= 21 & longitude >= -21 & longitude <= -16) %>%
+  dplyr::group_by(mois_de_peche) %>%
+  dplyr::summarise(Nombre_lignes = dplyr::n())
+
+resultat_nb <- resultat %>%
+  dplyr::left_join(nb_lignes_par_mois, by = "mois_de_peche")
+
+resultat_final <- resultat_nb %>%
+  dplyr::mutate(round(dplyr::across(dplyr::starts_with("num_"),
+                                    ~ .x / Nombre_lignes), 2))
+
+resultat_final
+```
+
+## *Table S7 -Number of species per sets observed in the biodiversity hotspot of Gabon*
+
+```{r}
+resultat <- data_clean_prep %>%
+  dplyr::filter(latitude <= 0 & latitude >= -4 & longitude >= 7 & longitude <= 10) %>%
+  dplyr::mutate(num_RM = num_RMM + num_RMT) %>%  # Replaces num_RMM and num_RMT with num_RM
+  dplyr::select(num_BUM,
+         num_MOX,
+         num_TRG,
+         num_RM,  
+         num_BSH,
+         num_FAL,
+         num_SPL,
+         num_SPZ,
+         num_SMA, 
+         num_LKV,
+         num_TTL,
+         mois_de_peche) %>%
+  dplyr::group_by(mois_de_peche) %>%
+  dplyr::summarise(dplyr::across(tidyr::starts_with("num_"), 
+                                 sum, 
+                                 na.rm = TRUE)) 
+
+
+
+nb_lignes_par_mois <- data_clean_prep %>%
+  dplyr::filter(latitude <= 0 & latitude >= -4 & longitude >= 7 & longitude <= 10) %>%
+  dplyr::group_by(mois_de_peche) %>%
+  dplyr::summarise(Nombre_lignes = dplyr::n())
+
+resultat_nb <- resultat %>%
+  dplyr::left_join(nb_lignes_par_mois, by = "mois_de_peche")
+
+resultat_final <- resultat_nb %>%
+  dplyr::mutate(round(dplyr::across(dplyr::starts_with("num_"), 
+                                    ~ .x / Nombre_lignes), 2))
+
+
+resultat_final
+
+```
+
+### *Table S8 - Number of species per sets observed in the biodiversity hotspot of Angola*
+
+```{r}
+resultat <- data_clean_prep %>%
+  dplyr::filter(latitude <= -7 & latitude >= -13 & longitude >= 10 & longitude <= 14) %>%
+  dplyr::mutate(num_RM = num_RMM + num_RMT) %>%  # Replaces num_RMM and num_RMT with num_RM
+  dplyr::select(num_BUM,
+         num_MOX,
+         num_TRG,
+         num_RM,  
+         num_BSH,
+         num_FAL,
+         num_SPL,
+         num_SPZ,
+         num_SMA, 
+         num_LKV,
+         num_TTL,
+         mois_de_peche) %>%
+  dplyr::group_by(mois_de_peche) %>%
+  dplyr::summarise(dplyr::across(dplyr::starts_with("num_"), 
+                                 sum, 
+                                 na.rm = TRUE)) 
+
+
+
+nb_lignes_par_mois <- data_clean_prep %>%
+  dplyr::filter(latitude <= -7 & latitude >= -13 & longitude >= 10 & longitude <= 14) %>%
+  dplyr::group_by(mois_de_peche) %>%
+  dplyr::summarise(Nombre_lignes = dplyr::n())
+
+resultat_nb <- resultat %>%
+  dplyr::left_join(nb_lignes_par_mois, by = "mois_de_peche")
+
+resultat_final <- resultat_nb %>%
+  dplyr::mutate(round(dplyr::across(dplyr::starts_with("num_"), ~ .x / Nombre_lignes), 2))
+
+
+resultat_final
+```
+
+## *Figure 3 - Spatial and Temporal Distribution of Smooth Hammerhead (SPZ) in Mauritania.*
+
+```{r}
+# Mauritania
+generate_fishing_maps_and_charts(obs_fob,
+                                 world_boundaries,
+                                 hotspot = "mauritania",
+                                 species = "SPZ")
+```
+
+### *Figure S4 - Spatial and Temporal Distribution of Scalloped Hammerhead (SPL) in Mauritania.*
+
+```{r}
+# Gabon
+generate_fishing_maps_and_charts(obs_fob,
+                                 world_boundaries,
+                                 hotspot = "gabon",
+                                 species = "SPZ")
+
+```
+
+### *Figure S5 - Spatial and Temporal Distribution of Silky shark (FAL) in Gabon.*
+
+```{r}
+# Angola
+generate_fishing_maps_and_charts(obs_fob,
+                                 world_boundaries,
+                                 hotspot = "angola",
+                                 species = "FAL")
+```
+
+### *Figure S6 - Sampling effort*
+
+```{r}
+y = data_clean
+y <- st_as_sf(data_clean, coords = c("longitude",
+                                     "latitude"), 
+              crs = 4326)  # CRS = WGS84
+
+
+z <- st_make_grid(y, cellsize = 0.5)
+
+z = st_make_grid(y,cellsize=0.5)
+zz = st_intersects(z,y)
+zzz = apply(zz,1,sum)
+df = data.frame(geom=z,count=zzz)
+df = st_as_sf(df)
+
+eez <- readRDS("E:/git/reduce/inst/eez.rds")
+
+worldmap = rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+ggplot2::ggplot() +
+  ggplot2::geom_sf(data = df, 
+                   ggplot2::aes(fill = count), 
+                   color = NA) +
+  ggplot2::scale_fill_gradientn(colours = grDevices::colorRampPalette(c("white", "red"))(100),
+                                name = "Sampling effort",  
+                                breaks = scales::pretty_breaks(n = 5), # number of ticks on the legend
+                                labels = scales::comma_format()) +
+  ggplot2::geom_sf(data = eez, color = "black", fill = NA) +
+  ggplot2::geom_sf(data = worldmap, fill = "grey90", color = "grey60", size = 0.1) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(panel.grid.major = ggplot2::element_line(color = "grey80", size = 0.1),
+                 legend.background = ggplot2::element_rect(fill = "gray95", color = NA),
+                 legend.key = ggplot2::element_rect(fill = "gray95", color = NA),
+                 panel.background = ggplot2::element_rect(fill = "white", color = NA),
+                 legend.position = "right",
+                 legend.title = ggplot2::element_text(size = 12, face = "bold", color = "black"),
+                 legend.text = ggplot2::element_text(size = 10, color = "black"),
+                 legend.key.height = ggplot2::unit(2, "cm"),  # height of the colour bar
+                 legend.key.width = ggplot2::unit(0.5, "cm")) +
+  ggplot2::guides(fill = ggplot2::guide_colorbar(barwidth = 0.5, 
+                                                 barheight = 8,
+                                                 ticks = TRUE,
+                                                 ticks.colour = "black",
+                                                 frame.colour = "black",
+                                                 frame.linewidth = 0.5)) +
+  ggplot2::coord_sf(xlim = sf::st_bbox(df)[c("xmin", "xmax")],
+                    ylim = sf::st_bbox(df)[c("ymin", "ymax")],
+                    expand = FALSE) +
+  ggplot2::geom_vline(xintercept = ocean_xintercept,
+                      linetype = "dashed",
+                      color = "darkgrey",
+                      linewidth = 0.2) +
+  ggplot2::geom_hline(yintercept = ocean_yintercept,
+                      linetype = "dashed",
+                      color = "darkgrey",
+                      linewidth = 0.2) +
+  ggplot2::theme(panel.border = ggplot2::element_rect(color = "black",
+                                                      fill = NA, 
+                                                      size = 0.3))
+
+```
