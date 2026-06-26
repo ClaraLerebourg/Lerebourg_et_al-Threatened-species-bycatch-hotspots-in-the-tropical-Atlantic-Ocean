@@ -1,4 +1,4 @@
-#Threatened species bycatch hotspots in the tropical Atlantic Ocean
+# Threatened species bycatch hotspots in the tropical Atlantic Ocean
 
 Repository accompanying the manuscript:
 
@@ -48,5 +48,6 @@ Main packages include (non-exhaustive):
 **Clara Lerebourg**
 
 MARBEC, Université de Montpellier – IRD
+email adress: clara.lerebourg@proton.me
 
 For questions regarding the analyses or the repository, please open an issue on GitHub or contact the corresponding author.
